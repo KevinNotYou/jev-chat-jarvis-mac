@@ -71,7 +71,7 @@ from perception import (  # noqa: E402
     frontmost_app_is_wechat, read_conversation, screen_capture_ok,
     request_screen_capture, warm_ocr)
 from judge import LowMemoryError, make_judge  # noqa: E402
-from generate import BUILTIN_SOURCE, Generator, load_credentials  # noqa: E402
+from generate import BUILTIN_SOURCE, Generator, load_credentials, request_url  # noqa: E402
 import styles  # noqa: E402
 import fill  # noqa: E402
 import ui_style  # noqa: E402
@@ -193,6 +193,11 @@ class HudController(NSObject):
         self._judged_once = False      # first judge call includes the local model load
         self._read_once = False        # first OCR call includes Vision's own load
         self._last_skip_reason = None
+        self._last_wait_signature = None
+        self._manual_read_seq = 0
+        self._manual_read_pending = 0
+        self._manual_read_deadline = 0.0
+        self._manual_capture_prepared_seq = 0
         self.judge = make_judge()
         self.generator = Generator()
         # 话术: per-slot tone selection. A slot on 不用 contributes no request and no rows,
@@ -227,7 +232,9 @@ class HudController(NSObject):
         self._next_read_ts = 0.0    # reads before this timestamp are skipped (quiet screen)
         self._fingerprint = None    # last chat-pane fingerprint; equal ⇒ skip OCR entirely
         self._last_full = None      # last OCR'd result, reused while the pane is unchanged
+        self._empty_reads = 0       # transient empty OCR frames
         self._analyzing = False     # judge+generate runs off the tick path
+        self._regenerating = False  # explicit candidate refresh; does not re-read/judge
         # Pre-judgment: the local judge starts the moment a new message is seen, and the
         # settle gate consumes the verdict if the text is unchanged — intent/risk land on
         # screen ~1 s earlier and only the (paid) generation half still waits. Single-slot
@@ -493,6 +500,20 @@ class HudController(NSObject):
                                   "track": track, "fill": fill_bar})
             self._rows.append(slot_rows)
 
+        self.reanalyze_button = self._make_button(
+            14, 0, 96, 28, "立刻分析", "reanalyze:", 0)
+        self.reanalyze_button.setAccessibilityLabel_("立刻分析")
+        self.reanalyze_button.setToolTip_("重新读取微信并执行完整分析")
+        view.addSubview_(self.reanalyze_button)
+        self._detail_views.append(self.reanalyze_button)
+
+        self.regenerate_button = self._make_button(
+            118, 0, PANEL_W - 132, 28, "重新生成推荐回答", "regenerateReply:", 0)
+        self.regenerate_button.setAccessibilityLabel_("重新生成推荐回答")
+        self.regenerate_button.setToolTip_("沿用当前消息和判断结果，只重新生成候选回答")
+        view.addSubview_(self.regenerate_button)
+        self._detail_views.append(self.regenerate_button)
+
         self.panel.setContentView_(view)
         self._title_h = self.panel.frame().size.height - PANEL_H   # measured, not assumed
         self._relayout()
@@ -600,7 +621,12 @@ class HudController(NSObject):
             if slot < styles.MAX_SLOTS - 1:
                 dy += GROUP_GAP
 
-        content_h = dy + BOTTOM_PAD
+        self.reanalyze_button.setHidden_(False)
+        self.regenerate_button.setHidden_(False)
+        placements.append((self.reanalyze_button, 14, dy, 96, 28))
+        placements.append((self.regenerate_button, 118, dy, PANEL_W - 132, 28))
+        dy += 28 + BOTTOM_PAD
+        content_h = dy
         view = self.panel.contentView()
         view.setFrameSize_(NSMakeSize(PANEL_W, content_h))
         fixed = []
@@ -887,7 +913,7 @@ class HudController(NSObject):
                 r["track"], r["fill"])
 
     @objc.python_method
-    def _render_groups(self, payload: list):
+    def _render_groups(self, payload: list, touched_slots=None):
         """payload: [(slot, tone, [{"text","prob"}, ...]), ...] — one entry per active tone.
 
         Rows the model did not fill are emptied and their buttons hidden. Every active tone
@@ -895,6 +921,7 @@ class HudController(NSObject):
         row so the complete text remains visible.
         """
         wanted = set()
+        touched = set(range(styles.MAX_SLOTS) if touched_slots is None else touched_slots)
         for slot, _tone, items in payload:
             for row in range(styles.PER_TONE):
                 if row < len(items):
@@ -908,7 +935,7 @@ class HudController(NSObject):
                     for c in self._row_controls(slot, row):
                         c.setHidden_(not self._slot_active(slot))
                     self.cand_texts[slot * styles.PER_TONE + row] = it["text"]
-        for slot in range(styles.MAX_SLOTS):
+        for slot in touched:
             for row in range(styles.PER_TONE):
                 if (slot, row) not in wanted and self._slot_active(slot):
                     r = self._rows[slot][row]
@@ -921,8 +948,9 @@ class HudController(NSObject):
         self._relayout()
 
     @objc.python_method
-    def _clear_candidates(self):
-        for slot in range(styles.MAX_SLOTS):
+    def _clear_candidates(self, slots=None):
+        slots = range(styles.MAX_SLOTS) if slots is None else slots
+        for slot in slots:
             for row in range(styles.PER_TONE):
                 r = self._rows[slot][row]
                 r["prob"].setStringValue_("")
@@ -1040,15 +1068,18 @@ class HudController(NSObject):
         picked = [p.titleOfSelectedItem() or styles.NONE_LABEL for p in self._dds]
         if picked == self.slot_tones:
             return
+        changed = [i for i, (old, new) in enumerate(zip(self.slot_tones, picked)) if old != new]
         self.slot_tones = picked
         # the panel is sized by how many slots are in use, so re-lay-out *before* the new
         # candidates arrive: the empty rows appear at once and nothing jumps later
-        self._clear_candidates()
-        self._stream_rows = {}     # the run _regenerate starts streams into fresh rows
-        self._regenerate()
+        self._clear_candidates(changed)
+        for slot in changed:
+            self._stream_rows.pop(slot, None)
+        for slot in changed:
+            self._regenerate(slot)
 
     @objc.python_method
-    def _regenerate(self):
+    def _regenerate(self, slot=None):
         """Re-run just the generation half for the message on screen.
 
         No re-judging and no re-reading of the screen: the intent and risk do not depend on
@@ -1059,15 +1090,21 @@ class HudController(NSObject):
         if not text:
             self._render("status", "话术已选 · 下条消息生效", PALETTE["muted"])
             return
-        active = [t for t in self.slot_tones if t in styles.PRESETS]
+        active = ([self.slot_tones[slot]] if slot is not None
+                  else [t for t in self.slot_tones if t in styles.PRESETS])
+        active = [t for t in active if t in styles.PRESETS]
         if not active:
             self._render("status", "没选话术 · 至少选一个", PALETTE["amber"])
             return
         self._render("status", f"换话术中…（{'、'.join(active)}）", PALETTE["muted"])
         self._set_candidate_header("候选回复 · 生成中…")
+        request_tones = list(self.slot_tones)
+        if slot is not None:
+            request_tones = [styles.NONE_LABEL] * styles.MAX_SLOTS
+            request_tones[slot] = self.slot_tones[slot]
         threading.Thread(target=self._reply_task,
                          args=(self._reply_epoch, self._regen_work,
-                               text, self._last_intent, list(self.slot_tones)),
+                               text, self._last_intent, request_tones, slot),
                          daemon=True).start()
 
     @objc.python_method
@@ -1131,7 +1168,7 @@ class HudController(NSObject):
         return on_candidate
 
     @objc.python_method
-    def _regen_work(self, text: str, intent: str, slot_tones: list[str]):
+    def _regen_work(self, text: str, intent: str, slot_tones: list[str], slot=None):
         t0 = time.perf_counter()
         try:
             if not self._reply_current():
@@ -1150,13 +1187,43 @@ class HudController(NSObject):
                 return
             # streamed endpoints already showed the lines; this push only matters for the
             # non-streaming shape (anthropic), which has no applyStreamLine_ at all
-            self._push("applyTones:", payload)
+            if slot is None:
+                self._push("applyTones:", payload)
+            else:
+                self._push("applyToneSlot:", (slot, payload))
             ranked = self._rank_payload(payload, text, intent)
             _log(f"换话术 端到端 {(time.perf_counter() - t0) * 1000:.0f}ms")
-            self._push("applyTones:", ranked)
+            if slot is None:
+                self._push("applyTones:", ranked)
+            else:
+                self._push("applyToneSlot:", (slot, ranked))
         except Exception as e:
             _log(f"换话术失败 {type(e).__name__}: {str(e)[:60]}")
             self._push("applyError:", f"换话术失败: {type(e).__name__}: {str(e)[:40]}")
+
+    @objc.python_method
+    def _regenerate_work(self, text: str, intent: str, slot_tones: list[str], context):
+        """Regenerate candidates atomically, retaining the old candidates on failure."""
+        t0 = time.perf_counter()
+        try:
+            if not self._reply_current():
+                return
+            gen = self.generator.generate(text, intent, slot_tones, context)
+            payload = self._payload_from_gen(gen)
+            if payload is None:
+                err = (gen.get("error") or "空结果")[:60]
+                _log(f"重新生成无可用候选: {err}")
+                self._push("applyError:", f"重新生成失败: {err}")
+                return
+            ranked = self._rank_payload(payload, text, intent)
+            _log(f"重新生成推荐回答 {(time.perf_counter() - t0) * 1000:.0f}ms · "
+                 f"{sum(len(items) for _s, _t, items in ranked)} 条候选")
+            self._push("applyRegenerated:", ranked)
+        except Exception as e:
+            _log(f"重新生成失败 {type(e).__name__}: {str(e)[:60]}")
+            self._push("applyError:", f"重新生成失败: {type(e).__name__}: {str(e)[:40]}")
+        finally:
+            self._regenerating = False
 
     @objc.python_method
     def _payload_current(self, payload) -> bool:
@@ -1181,7 +1248,51 @@ class HudController(NSObject):
         self._render("status", f"已换话术 · {total} 条", PALETTE["muted"])
         self._render_groups(payload)
 
+    def applyToneSlot_(self, update):
+        slot, payload = update
+        if not self._payload_current(payload):
+            return
+        self._set_candidate_header(self._cand_header(payload))
+        total = sum(len(items) for _s, _t, items in payload)
+        self._render_groups(payload, {slot})
+        self._render("status", f"已更新当前话术 · {total} 条", PALETTE["muted"])
+
+    def applyRegenerated_(self, payload):
+        if not self._payload_current(payload):
+            return
+        self._set_candidate_header(self._cand_header(payload))
+        total = sum(len(items) for _s, _t, items in payload)
+        self._render_groups(payload)
+        self._render("status", f"已重新生成 · {total} 条", PALETTE["muted"])
+
     # ------------------------------------------------------------ controls
+    def regenerateReply_(self, sender):
+        """Regenerate candidates from the current message without re-reading or judging."""
+        if self._regenerating:
+            self._render("status", "推荐回答生成中…", PALETTE["muted"])
+            return
+        text = self.analyzed_text
+        full = self._last_full or {}
+        messages = full.get("messages") or []
+        newest = next((m for m in reversed(messages)
+                       if m.side == "them" and m.text == text), None)
+        active = [t for t in self.slot_tones if t in styles.PRESETS]
+        if not text or newest is None or self._reply_key is None:
+            self._render("status", "当前没有可重新生成的推荐回答", PALETTE["amber"])
+            return
+        if not active:
+            self._render("status", "没选话术 · 至少选一个", PALETTE["amber"])
+            return
+        context = self._context_text(messages, newest)
+        self._regenerating = True
+        self._set_candidate_header("候选回复 · 重新生成中…")
+        self._render("status", "重新生成推荐回答…", PALETTE["muted"])
+        _log(f"重新生成推荐回答 · 已请求 · 消息={text[:40]}")
+        threading.Thread(target=self._reply_task,
+                         args=(self._reply_epoch, self._regenerate_work,
+                               text, self._last_intent, list(self.slot_tones), context),
+                         daemon=True).start()
+
     def collapsePanel_(self, sender):
         self._set_collapsed(not self._collapsed)
 
@@ -1213,13 +1324,29 @@ class HudController(NSObject):
             self._render("status", "已恢复 · 读屏中", PALETTE["muted"])
 
     def reanalyze_(self, sender):
+        self._manual_read_seq += 1
+        self._manual_read_pending = self._manual_read_seq
+        self._manual_read_deadline = time.time() + 5.0
         self._prejudge_req = None      # "re-analyze" means re-run, not reuse the pre-judge
         self._prejudge_result = None
         self._pregen_req = None        # …and not reuse the early generation either
         self._pregen_result = None
         self.last_seen = None
         self.analyzed_text = None
+        self._fingerprint = None
+        self._stable_n = 0
+        self._next_read_ts = 0
+        _log(f"手动重新分析 #{self._manual_read_seq} · 已请求"
+             f"（暂停={self._paused}，读屏占用={self._busy}）")
         self._render("status", "重新分析中…", PALETTE["muted"])
+        if not self._paused and not self._busy:
+            self._busy = True
+            _log(f"手动重新分析 #{self._manual_read_seq} · 立即启动读屏")
+            threading.Thread(target=self._work, daemon=True).start()
+        elif self._paused:
+            _log(f"手动重新分析 #{self._manual_read_seq} · 已暂停，未启动读屏")
+        else:
+            _log(f"手动重新分析 #{self._manual_read_seq} · 当前读屏占用，等待下一轮")
 
     def quitApp_(self, sender):
         AppKit.NSApplication.sharedApplication().terminate_(None)
@@ -1317,6 +1444,36 @@ class HudController(NSObject):
             self._busy = False
 
     @objc.python_method
+    def _prepare_manual_capture(self, manual_seq: int):
+        """Make WeChat expose its main window using its configured screenshot shortcut."""
+        try:
+            time.sleep(0.25)
+            activation = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell application process "WeChat" '
+                 'to set frontmost to true'],
+                capture_output=True, text=True)
+            if activation.returncode != 0:
+                raise RuntimeError(activation.stderr.strip() or "无法激活微信")
+            time.sleep(0.3)
+            import Quartz
+            flags = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskCommand
+            for down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+                Quartz.CGEventSetFlags(event, flags)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+                time.sleep(0.04)
+            time.sleep(0.35)
+            for down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 53, down)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+                time.sleep(0.04)
+            _log(f"手动重新分析 #{manual_seq} · 已触发微信截图并取消")
+        except Exception as e:
+            _log(f"手动重新分析 #{manual_seq} · 微信截图准备失败："
+                 f"{type(e).__name__}: {str(e)[:80]}")
+
+    @objc.python_method
     def _work_inner(self):
         # The panel is a global floating window. Showing it over Chrome while continuing
         # to reuse the last WeChat frame makes stale text look like browser OCR. Treat app
@@ -1333,6 +1490,12 @@ class HudController(NSObject):
         if not frontmost_is_wechat:
             self._next_read_ts = time.time() + FAST_TICK
             return
+        manual_seq = getattr(self, "_manual_read_pending", 0)
+        if (manual_seq and getattr(self, "_manual_capture_prepared_seq", 0) != manual_seq):
+            self._prepare_manual_capture(manual_seq)
+            self._manual_capture_prepared_seq = manual_seq
+        if manual_seq:
+            _log(f"手动重新分析 #{manual_seq} · 读屏开始")
         if not screen_capture_ok():
             if not self._asked_permission:
                 self._asked_permission = True
@@ -1342,9 +1505,11 @@ class HudController(NSObject):
             return
         capture_foreground_epoch = self._foreground_epoch
         try:
-            res = read_conversation(previous_wid=self._win_wid,
-                                    prev_fingerprint=self._fingerprint,
-                                    prev_layout=getattr(self, "_layout_key", None))
+            read_args = {"previous_wid": self._win_wid,
+                         "prev_fingerprint": self._fingerprint}
+            if getattr(self, "_layout_key", None) is not None:
+                read_args["prev_layout"] = self._layout_key
+            res = read_conversation(**read_args)
         except Exception as e:
             self._push("applyError:", f"读取失败: {type(e).__name__}: {str(e)[:40]}")
             self._next_read_ts = time.time() + SLOW_TICK
@@ -1362,6 +1527,11 @@ class HudController(NSObject):
             self._next_read_ts = time.time() + FAST_TICK
             return
         if not res["ok"]:
+            if manual_seq and time.time() < self._manual_read_deadline:
+                self._fingerprint = None
+                self._next_read_ts = 0
+                _log(f"手动重新分析 #{manual_seq} · 暂时不可读：{res['error']}，5 秒期限内继续重试")
+                return
             # Window enumeration/capture can miss one frame while WeChat redraws.
             # Keep the already-current HUD stable for a short grace period, then
             # hide and force rediscovery if the failure really persists.
@@ -1387,6 +1557,38 @@ class HudController(NSObject):
                 self._push("applyForegroundHidden:", res["error"])
             self._next_read_ts = time.time() + FAST_TICK
             return
+
+        if manual_seq:
+            timing = res.get("timing_ms") or {}
+            _log(f"手动重新分析 #{manual_seq} · 读屏结果："
+                 f"窗口={res['window'].get('wid')} {res['window'].get('title')!r}，"
+                 f"路径={timing.get('capture_path', 'unknown')}，"
+                 f"OCR块={res.get('n_blocks', 0)}，消息={len(res['messages'])}，"
+                 f"画面未变={res.get('unchanged', False)}")
+            if (not res.get("unchanged") and not res["messages"]
+                    and time.time() < self._manual_read_deadline):
+                self._fingerprint = None
+                self._next_read_ts = 0
+                self._manual_capture_prepared_seq = 0
+                _log(f"手动重新分析 #{manual_seq} · 空帧，重试")
+                return
+            if self._manual_read_pending == manual_seq:
+                self._manual_read_pending = 0
+
+        if (res.get("timing_ms") is not None and not res["unchanged"] and not res["messages"]
+                and self._last_full is not None and self._last_full.get("messages")):
+            if self._empty_reads == 0:
+                _log("读屏瞬时为空 · 保留上一帧并继续重试")
+            self._empty_reads += 1
+            # A blank capture is not a new chat frame. Reuse the last complete frame for
+            # the settle gate, so one transient blank cannot keep a real message in
+            # "等待停稳" forever.
+            cached = dict(self._last_full)
+            cached["unchanged"] = True
+            cached["window"] = res["window"]
+            cached["input_rect"] = res.get("input_rect")
+            res = cached
+        self._empty_reads = 0
 
         self._read_fail_since = None
         self._read_fail_hidden = False
@@ -1461,9 +1663,16 @@ class HudController(NSObject):
             self._push("applyBoxes:", (res["window"], msgs,
                                        newest.text if newest else None))
         if newest is None:
+            wait_signature = tuple(m.side for m in msgs)
+            if wait_signature != getattr(self, "_last_wait_signature", None):
+                self._last_wait_signature = wait_signature
+                _log(f"等待对方消息 · 读到 {len(msgs)} 条（自己 "
+                     f"{sum(m.side == 'me' for m in msgs)} / 未知 "
+                     f"{sum(m.side == 'unknown' for m in msgs)}）")
             self._push("applyWaiting:", "暂未确认输入区边界，暂停分析"
                        if res.get("input_unresolved") else None)
             return
+        self._last_wait_signature = None
         now = time.time()
 
         # --- anti-flood: track arrivals, never analyze mid-burst
@@ -1833,7 +2042,9 @@ class HudController(NSObject):
     @objc.python_method
     def _push(self, selector: str, payload=None):
         if selector in {"applyIncoming:", "applyPending:", "applyJudgment:",
-                        "applyCandidates:", "applyStreamLine:", "applyWaiting:", "applyError:"}:
+                        "applyCandidates:", "applyRegenerated:", "applyToneSlot:",
+                        "applyStreamLine:",
+                        "applyWaiting:", "applyError:"}:
             epoch = getattr(self._reply_worker, "epoch", self._reply_epoch)
             self._push_reply(selector, payload, epoch)
             return
@@ -2196,9 +2407,10 @@ def main() -> None:
     # First line of every run: which backends are actually in play. Support requests
     # always need it, and it proves the log is live before the first message arrives.
     _base, _key, _model, _src, _api = load_credentials()
+    _request_url = request_url(_base, _api)
     _log(f"启动 · 判断层 "
          f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY') else '本地 decider-2b'}"
-         f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
+         f" · 生成层 {(_request_url + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
          + ("（内置默认）" if _src == BUILTIN_SOURCE else "")
          + (" · YOLO 框开" if controller._show_boxes else ""))
     controller._show()

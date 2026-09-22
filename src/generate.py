@@ -258,6 +258,11 @@ def _endpoint(base: str, api: str) -> str:
     return b + ("/chat/completions" if has_version else "/v1/chat/completions")
 
 
+def request_url(base: str, api: str) -> str:
+    """Return the complete URL used for one generation request."""
+    return _endpoint(base, api)
+
+
 def pick_api_format(base: str, configured: str | None) -> str:
     """Explicit setting wins; otherwise infer from the URL.
 
@@ -355,16 +360,17 @@ def _extra_params() -> dict:
 def credential_status() -> str:
     """Human-readable state for --check; the key itself is never printed."""
     base, key, model, source, api = load_credentials()
+    url = request_url(base, api)
     shape = ("Anthropic 格式 /v1/messages" if api == "anthropic"
              else "OpenAI 格式 /v1/chat/completions")
     home = str(Path.home())
     if not key:
         return (f"❌ 未配置 API Key\n"
-                f"   端点: {base}  ({shape})\n"
+                f"   请求 URL: {url}  ({shape})\n"
                 f"   模型: {model}\n"
                 f"   {MISSING_HINT}")
     return (f"✅ 凭据来源: {source.replace(home, '~')}\n"
-            f"   端点: {base}\n"
+            f"   请求 URL: {url}\n"
             f"   接口: {shape}\n"
             f"   模型: {model}\n"
             f"   Key : {key[:6]}…{key[-4:]}  ({len(key)} chars)")
@@ -556,7 +562,7 @@ class Generator:
             detail = e.read()[:160].decode(errors="replace")
             return [], f"HTTP {e.code} @ {self._last_url} — {detail}"
         except Exception as e:
-            return [], f"{type(e).__name__}: {e}"
+            return [], f"{type(e).__name__} @ {self._last_url}: {e}"
         if on_line is not None:
             # Sync the callback with the authoritative parse. Two ways lines can be
             # missing from what the stream emitted: the model often stops without a

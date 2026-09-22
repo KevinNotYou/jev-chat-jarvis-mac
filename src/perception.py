@@ -178,8 +178,11 @@ def find_wechat_window(previous_wid: int | None = None) -> WindowInfo | None:
     return best
 
 
-def capture_window(wid: int, out: Path) -> bool:
-    p = subprocess.run(["screencapture", "-x", "-o", "-l", str(wid), str(out)],
+def capture_window(win: WindowInfo, out: Path) -> bool:
+    # On macOS 27, `-l <window id>` can resolve to a small child window. Capture the
+    # visible main-window region when the in-process capture returned no image.
+    region = f"{int(win.x)},{int(win.y)},{int(win.w)},{int(win.h)}"
+    p = subprocess.run(["screencapture", "-x", "-R" + region, str(out)],
                        capture_output=True, text=True)
     return p.returncode == 0 and out.exists() and out.stat().st_size > 1000
 
@@ -558,7 +561,7 @@ def read_conversation(max_messages: int = 12, previous_wid: int | None = None,
     if image is None:
         with tempfile.TemporaryDirectory() as td:
             png = Path(td) / "wechat.png"
-            if capture_window(win.wid, png):
+            if capture_window(win, png):
                 from Foundation import NSURL
                 source = Quartz.CGImageSourceCreateWithURL(NSURL.fileURLWithPath_(str(png)), None)
                 image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None) if source else None

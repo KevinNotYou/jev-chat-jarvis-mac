@@ -62,6 +62,13 @@ class SettingsFiles(unittest.TestCase):
             self.assertEqual(load_credentials()[-1], 'openai')
             self.assertEqual(load_credentials()[2], 'other')
 
+    def test_credential_status_shows_complete_request_url(self):
+        from generate import credential_status
+        with patch('generate.load_credentials', return_value=(
+                'http://127.0.0.1:1234/v1', 'local', 'model', 'test', 'openai')):
+            status = credential_status()
+        self.assertIn('请求 URL: http://127.0.0.1:1234/v1/chat/completions', status)
+
     def test_running_config_stays_until_restart(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'env'
