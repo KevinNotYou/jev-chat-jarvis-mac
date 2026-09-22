@@ -1464,11 +1464,19 @@ class HudController(NSObject):
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
                 time.sleep(0.04)
             time.sleep(0.35)
+            current = Quartz.CGEventCreate(None)
+            point = Quartz.CGEventGetLocation(current)
+            for event_type in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                event = Quartz.CGEventCreateMouseEvent(
+                    None, event_type, point, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+                time.sleep(0.05)
+            time.sleep(0.1)
             for down in (True, False):
                 event = Quartz.CGEventCreateKeyboardEvent(None, 53, down)
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
                 time.sleep(0.04)
-            _log(f"手动重新分析 #{manual_seq} · 已触发微信截图并取消")
+            _log(f"手动重新分析 #{manual_seq} · 已触发微信截图、当前鼠标左键点击并取消")
         except Exception as e:
             _log(f"手动重新分析 #{manual_seq} · 微信截图准备失败："
                  f"{type(e).__name__}: {str(e)[:80]}")
